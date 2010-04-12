@@ -1,0 +1,87 @@
+mailmover
+    mailmover - A tool to redirect mail files from any directory to any
+    other directory (usually the system's default mail queue).
+
+SYNOPSIS
+    mailmover [-c] [--dest-dir] [-l] [--source-dir] [-v|-h] [--domain]
+    [--key-file] [--selector] [--type] [--nosign [--move-all]]
+    [--external-mailer]
+
+OPTIONS
+     --selector
+            The selector used by DKIM.
+
+     --source-dir
+            Directory to copy mail from.
+
+     --dest-dir
+            Directory to copy mail to, usually the system-wide mail queue
+            (e.g. /var/spool/mailq).
+
+     --domain
+            The domain name used by DKIM
+
+    -e, --external-mailer
+            Don't sign messages. Just send them via an MTA specified in the
+            configuration file.
+
+    -h, --help
+            Display help screen and exit.
+
+    -k, --key-file
+            Full path to and file name of the file containing the private
+            key with which to DKIM-sign messages.
+
+    -l, --log-level
+            The logger's threshold value. May be one of DEBUG, INFO, WARN,
+            ERROR.
+
+    -n, --nosign
+            Do not sign the messages, only move them
+
+    -m, --move-all
+            Move all messages/files as soon as they come in. Works only in
+            conjunction with --nosign.
+
+    -v, --version
+            Display version screen and exit.
+
+DESCRIPTION
+    MailMover was originally written to be used in conjunction with OpenEMM,
+    an open-source newsletter management application. OpenEMM does not,
+    itself provide support for *DomainKeys Identified Mail* (*DKIM*). So,
+    the idea was born to write a tool which monitors OpenEMM's own mail
+    queue directory, signs outbound mails and moves them to the system-wide
+    mail queue (/var/spool/mailq on Debian based systems) as soon as they
+    land there. From there on, the system-wide sendmail process takes over.
+
+CONFIGURATION
+    MailMover reads in a configuration file that is per default located in
+    ${HOME}/.mailmover.conf. The config file is made up of command line
+    options minus the preceding dashes as keys. Comments on a line of their
+    own preceded by a hash sign (#) are ignored, as are blank lines and
+    trailing whitespace.
+
+    Command line options take precedence over configuration file options.
+    Configuration file options take precedence over default options.
+
+BUGS
+    A few. Probably. Let me know if you find any. :-)
+
+LICENSE
+    This program is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the
+    Free Software Foundation, either version 3 of the License, or (at your
+    option) any later version.
+
+    This program is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+    Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program. If not, see <http://www.gnu.org/licenses/>.
+
+AUTHOR
+    Sven-Thorsten Fahrbach You can reach me at <joran@alice-dsl.de>
+
