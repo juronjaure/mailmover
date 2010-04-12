@@ -1,0 +1,1340 @@
+#!/usr/bin/perl
+
+#----------------------------------------------------------------------------------------
+# mailmover
+#----------------------------------------------------------------------------------------
+#
+# This is part of a very ugly hack. Don't try this at home! Keep away from children!
+# Polls for new mail in OpenEMM's mail spool and moves it to
+# the system's sendmail spool dir.
+#
+#----------------------------------------------------------------------------------------
+# 
+# Copyright (C) 2009 Sven-Thorsten Fahrbach
+#
+# mailmover is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# mailmover is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with mailmover.  If not, see <http://www.gnu.org/licenses/>.
+#----------------------------------------------------------------------------------------
+
+use warnings;
+use strict;
+use Linux::Inotify2;
+use File::Spec;
+use File::Basename;
+use File::Copy;
+use File::Temp qw/ tempfile tempdir /;
+use Cwd;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+use Log::Log4perl qw/ get_logger :levels /;
+use Mail::DomainKeys;
+use Mail::DomainKeys::Key::Private;
+use Mail::DomainKeys::Message;
+use Mail::DKIM::Signer;
+use Mail::DKIM::Verifier;
+use Mail::DKIM::TextWrap;
+use Mail::DKIM::DkSignature;
+use Mail::Sender;
+use MIME::Base64;
+use Email::Simple;
+use MIME::QuotedPrint;
+use HTML::TokeParser;
+use POSIX;
+
+#----------------- TODO -----------------------------------------------------------------
+#
+#   - implement file locking
+#   - optimize code
+#   - Keep POD up-to-date
+#
+#----------------------------------------------------------------------------------------
+
+
+
+###############    SET UP VARIABLES    ##################################################
+
+#----------------- GLOBALS --------------------------------------------------------------
+
+our $VERSION        = "0.10";
+our $MAILMOVER_CONF = "/etc/mailmover.conf";
+our $LOG4PERL_CONF  = "/etc/mailmover_logger.conf";
+our $Timestamp;
+our $Debug_canonicalization_filename = "/var/log/mailmover_canon_mail.log";
+
+$Data::Dumper::Purity = 1;
+
+#----------------------------------------------------------------------------------------
+
+
+#----------------- SET CONFIG DEFAULTS --------------------------------------------------
+#
+#   we need the following config values:
+#       source-dir - where we copy our mails from
+#       dest-dir   - where we copy our mails to
+#       log-level  - guess
+#       conf-file  - :-)
+#       key-file   - the private key used to sign the message
+#       selector   - DKIM selector
+#       domain     - DKIM domain
+#
+#----------------------------------------------------------------------------------------
+
+my %conf;
+# Step 1 - we define some default values
+my %defaults = ('source-dir'     => getcwd,
+                'dest-dir'       => "/var/spool/mqueue",
+                'log-level'      => undef,
+                'conf-file'      => $MAILMOVER_CONF,
+                'key-file'       => "/etc/mailmover/private.key",
+                'type'           => "domainkeys");
+
+#--------------------------------
+# DEBUG
+# print STDERR "Defaults:\n";
+# print STDERR Dumper(%defaults);
+#--------------------------------
+
+# Command line options override config file options
+my %options;
+GetOptions(\%options, "source-dir=s",
+                      "dest-dir=s",
+                      "domain=s",
+                      "key-file=s",
+                      "selector=s",
+                      "log-level=s",
+                      "conf-file=s",
+                      "nosign",
+                      "move-all",
+                      "type=s",
+                      "external-mailer",
+                      "help|?",
+                      "version");
+
+#------------------------------
+# DEBUG
+#print STDERR "Options:\n";
+#print STDERR Dumper(%options);
+#------------------------------
+
+###############    END SET VARIABLES    #################################################
+
+
+
+###############    BASIC CONFIGURATION    ###############################################
+
+# if we were called with --help or --version, we can exit immediately
+if ($options{help}) {
+    pod2usage( -verbose => 1 );
+}
+if ($options{version}) {
+    print "$0 $VERSION\n";
+    print "Copyright (C) 2009-2010 Sven-Thorsten Fahrbach\n";
+    print "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>\n";
+    print "This is free software: you are free to change and redistribute it.\n";
+    print "There is NO WARRANTY, to the extent permitted by law.\n";
+
+    exit(0);
+}
+
+# Step 2 - we need to get the name of the config file from the command line options first
+if ($options{'conf-file'}) {
+    $defaults{'conf-file'} = $options{'conf-file'};
+}
+
+%conf = merge_hashes(\%defaults, \%conf);
+
+# Step 3 - We overwrite default values with the ones from the config file if they exist
+if ($defaults{'conf-file'}) {
+    my ($key, $value);
+    my %tmp = read_config($defaults{'conf-file'});          # this is not pretty at all -.-
+    while (($key, $value) = each %tmp) {
+        last if $key eq "error";
+        $conf{$key} = $value;
+    }
+
+    #----------------------------
+    # DEBUG
+    # print STDERR "tmp:\n";
+    # print STDERR Dumper(%tmp);
+    # print STDERR "conf:\n";
+    # print STDERR Dumper(%conf);
+    #----------------------------
+}
+
+# Step 4 - Finally, we can overwrite the remaining values with those from the command line
+%conf = merge_hashes(\%conf, \%options);    # values from first will be overwritten with values from second
+#----------------------------
+# DEBUG
+# print STDERR "conf:\n";
+# print STDERR Dumper(%conf);
+#----------------------------
+
+
+#----------------- LOGGER CONFIGURATION -------------------------------------------------
+Log::Log4perl->init_and_watch($LOG4PERL_CONF, 60);
+my $logger = get_logger("MailMover");
+if ($conf{'log-level'}) {
+    foreach ($conf{'log-level'}) {
+        if (/debug/i) {
+            $logger->level($DEBUG);
+        } elsif (/info/i) {
+            $logger->level($INFO);
+        } elsif (/warn/i) {
+            $logger->level($WARN);
+        } elsif (/error/i) {
+            $logger->level($ERROR);
+        } else {
+            warn "Unknown log level $_\n";
+        }
+    }
+}
+
+my $signer_logger = get_logger("Signer");
+
+$logger->info("Logger initialized");
+
+#----------------------------------------------------------------------------------------
+
+
+#----------------- CHECK FOR INCONSISTENCIES IN CONFIGURATION OPTIONS -------------------
+
+if ((exists $conf{'move-all'}) && (! exists $conf{'nosign'})) {
+    $logger->error("Need --nosign with --move-all. I won't continue.");
+    exit(1);
+}
+unless (-d $conf{'source-dir'}) {
+    $logger->error("Source directory $conf{'source-dir'} doesn't exist");
+    exit(1);
+}
+if (! -d $conf{'dest-dir'}) {
+    if (-e $conf{'dest-dir'}) {
+        $logger->error("Can't write to $conf{'dest-dir'}: Not a directory");
+    } else {
+        $logger->error("Destination directory $conf{'dest-dir'} doesn't exist");
+    }
+    exit(1);
+}
+if ((! -e $conf{'key-file'}) || (-d $conf{'key-file'})) {
+    $logger->error("Could not open " . $conf{'key-file'} . ". Will now exit.");
+    exit(1);
+}
+if (! $conf{'external-mailer'}) {
+    unless ($conf{selector}) {
+        $logger->error("Need a selector. Will now exit.");
+        exit(1);
+    }
+    unless ($conf{'domain'}) {
+        $logger->error("Need a domain for DKIM. Will now exit.");
+        exit(1);
+    }
+    if ($conf{'type'}) {
+        $conf{'type'} = lc($conf{'type'});
+        unless (($conf{'type'} eq "domainkeys") || ($conf{'type'} eq "dkim")) {
+            $logger->error("Unrecognized signature type $conf{type}. Falling back to 'domainkeys'.");
+            $conf{'type'} = "domainkeys";
+        }
+    }
+} else {
+    unless ($conf{nosign}) {
+        $logger->warn("Signing mails with an external mailer is not implemented.\n" .
+                      "I will continue but I will not sign any mails on my own.");
+        $conf{nosign} = 1;
+    }
+    unless ($conf{'external-username'}) {
+        $logger->error("Need a username to use with external mailer. Please check your connection details.");
+        exit(1);
+    }
+    unless ($conf{'external-password'}) {
+        $logger->error("Need a password to use with external mailer. Please check your connection details.");
+        exit(1);
+    }
+    unless ($conf{'external-address'}) {
+        $logger->error("Need an e-mail address to use with external mailer. Please check your connection details.");
+        exit(1);
+    }
+    unless ($conf{'external-server'}) {
+        $conf{'external-server'} = `hostname -f` || die "Could not determine FQD. Exiting.";
+    }
+    unless ($conf{'external-port'}) {
+        $conf{'external-port'} = 25;
+    }
+}
+
+#----------------- END INCONSISTENCY CHECK ----------------------------------------------
+
+###############    END BASIC CONFIGURATION    ###########################################
+
+
+        
+###############    SET UP INOTIFY    ####################################################
+my $inotify = new Linux::Inotify2
+        or die "Could not create inotify object: $!";
+$inotify->watch($conf{'source-dir'}, IN_CREATE)
+        or die "Could not create watch on dir $conf{'source-dir'}: $!";
+$logger->debug("Created watch on $conf{'source-dir'}");
+
+
+###############    MAIN    ##############################################################
+
+# we have to keep track of what files we have already moved
+my %files;
+
+# main loop
+while (1) {
+    $logger->debug("About to call \$inotify->read()");
+    my @events = $inotify->read;
+    unless (@events > 0) {
+        print "read error: $!";
+        last;
+    }
+    #----------------- THE MAIN EVENT LOOP ----------------------------------------------
+    foreach my $event (@events) {
+        if ($event->IN_CREATE || $event->IN_MOVED_TO) {
+            next if exists $files{File::Spec->catfile($event->{w}{name}, $event->{name})};
+
+            $logger->debug("A file has been created");
+            # OpenEMM needs a while to create both of the necessary mail files. We give it half a minute
+
+            # this hash will hold the files that we are to move later on
+            my %copy_files;
+
+
+
+            #----------------------------------------------------------------------------
+            # Have we been called with --move-all?
+            # Then move all files indiscriminately as soon as they come in.
+            #----------------------------------------------------------------------------
+            if ($conf{"move-all"}) {
+                my $file = File::Spec->catfile($event->{w}{name}, $event->{name});
+                next if exists $files{$file};
+
+                $logger->error("Couldn't move $file to " . File::Spec->catfile($conf{'dest-dir'}, $event->{name}) . ": $!")
+                    unless move($file, File::Spec->catfile($conf{'dest-dir'}, $event->{name}));
+
+                next;
+            }
+            #----------------------------------------------------------------------------
+
+
+
+
+            #--------------------------------- Wait for the two mail file parts ---------
+
+            #-------------------------------
+            # the first one of the file pair
+            #-------------------------------
+            my $full_src_path  = File::Spec->catfile($event->{w}{name}, $event->{name});
+            my $full_dest_path = File::Spec->catfile($conf{'dest-dir'}, $event->{name});
+
+            # we need to find out which of the two files we're waiting for.
+            # the files come in two flavors:
+            #       df.+        and
+            #       qf.+
+            my ($name, $path, $suffix) = fileparse($full_src_path);
+            my $wait_for;
+            if ($name =~ /^df(.+)$/) {
+                $copy_files{df} = $full_src_path;
+                $wait_for = "qf$1";
+            } elsif ($name =~ /^qf(.+)$/) {
+                $copy_files{qf} = $full_src_path;
+                $wait_for = "df$1";
+            } else {
+                # this shouldn't happen
+                $logger->info("Unexpected file created in $path: $name.$suffix. I'll simply ignore it.");
+                next;
+            }
+            if ($suffix) {
+                # this shouldn't happen either
+                $logger->info("Unexpected file created in $path: $name.$suffix. I'll simply ignore it.");
+                next;
+            }
+            $copy_files{ exists $copy_files{qf} ? 'df' : 'qf' } = File::Spec->catfile($event->{w}{name}, $wait_for);
+
+
+            #----------------
+            # the second file
+            #----------------
+            unless (-e File::Spec->catfile($path, $wait_for)) {
+                # poll for 10 seconds
+                my $found = 0;
+                my $i     = 0;
+                while ($i++ < 10) {
+                    sleep(1);
+                    if (-e File::Spec->catfile($path, $wait_for)) {
+                        $found = 1;
+                        last;
+                    }
+                }
+                unless ($found) {
+                    $logger->error("Timed out waiting for file " . File::Spec->catfile($path, $wait_for) . ". Skipping.");
+
+                    # also, we won't try to move the file pair again in the future
+                    $files{$full_src_path} = 1;
+                    $files{ File::Spec->catfile($path, $wait_for) } = 1;
+                    next;
+                }
+            }
+
+            #----------------------------------------------------------------------------
+
+
+            #-------------------- PROCESS FILES -----------------------------------------
+
+            #----------------------------------------------
+            #
+            # Open both files for reading.
+            # Create another, temporary, file  - $COMPLETE
+            # with the contents of both.
+            #
+            # df* files contain the message body
+            # qf* files contain the headers
+            #
+            #----------------------------------------------
+            
+            unless (sysopen(QF, $copy_files{qf}, O_RDONLY)) {
+                $logger->error("Couldn't open file $copy_files{qf} for writing: $!. Skipping.");
+                next;
+            }
+            unless (sysopen(DF, $copy_files{df}, O_RDONLY)) {
+                $logger->error("Couldn't open file $copy_files{df} for writing: $!. Skipping.");
+                next;
+            }
+
+
+
+            #----------------------------------------------------------------------------
+            # Have we been called with --external-mailer?
+            # Then just send the mail via the specified MTA.
+            #----------------------------------------------------------------------------
+            if ($conf{"external-mailer"}) {
+                my ($COMPLETE, undef) = get_tempfile();
+                print $COMPLETE $_ while <QF>;
+                print $COMPLETE "\n";                           # We need a line break between headers and body.
+                print $COMPLETE $_ while <DF>;
+                send_mail($COMPLETE);
+
+                $logger->warn("Couldn't close filehandle on $copy_files{qf}") unless close QF;
+                $logger->warn("Couldn't close filehandle on $copy_files{df}") unless close DF;
+                $logger->warn("Couldn't delete $copy_files{qf}")              unless unlink $copy_files{qf};
+                $logger->warn("Couldn't delete $copy_files{df}")              unless unlink $copy_files{df};
+
+                next;
+            }
+            #----------------------------------------------------------------------------
+
+
+
+
+            #----------------------------------------------------------------------------
+            # Let's get the message signed and drop it in the mail spool.
+            #----------------------------------------------------------------------------
+            my $signature = get_signature(\*QF, \*DF);
+            close DF or $logger->error("Couldn't close filehandle on $copy_files{df}: $!.");
+            if ($conf{nosign}) {
+                close QF or $logger->error("Couldn't close filehandle on $copy_files{df}: $!.");
+            } else {
+                prepend_header(\*QF, $copy_files{qf}, $signature);   # filehandle will be closed on return of prepend_header()!
+            }
+
+            #--------------------------- MOVE THE FILES ---------------------------------
+
+            foreach (keys %copy_files) {
+                my $from = $copy_files{$_};
+                my $to   = File::Spec->catfile($conf{'dest-dir'}, basename($copy_files{$_}));
+                # have we already moved the file?
+                if (exists $files{$from}) {
+                    # ... then we won't move it again.
+                    # in fact, though, this shouldn't happen.
+                    $logger->warn("File $from already processed. Won't try to move it again.");
+                    next;
+                }
+                if (copy($from, $to)) {
+                    $files{$from} = $to;
+                    $logger->info("Copied $from to $to");
+                } else {
+                    $logger->error("Couldn't copy $from to $to: $!");
+                    next;           # don't unlink if we couldn't move the file
+                }
+                unless (unlink $from) {
+                    $logger->error("Couldn't delete $from: $!");
+                }
+            }
+
+            #----------- End move files -------------------------------------------------
+
+        }
+    }
+
+    #------------------- END MAIN EVENT LOOP --------------------------------------------
+}
+
+#############    SUBS    ################################################################
+
+#--------------- MAIL SUBS --------------------------------------------------------------
+
+#----------------
+sub get_signature
+#----------------
+{
+    my ($QF, $DF) = @_;
+    my ($TMPFILE, $tmpfilename) = get_tempfile();
+
+    my $signature;
+    if ($conf{'type'} eq "dkim" || $conf{'type'} eq "domainkeys") {
+        my $dkim = Mail::DKIM::Signer->new(
+                    Policy          => \&signer_policy,
+                    KeyFile         => $conf{"key-file"},
+                );
+
+        foreach my $fh ($QF, $DF) {
+            while (<$fh>) {
+                chomp;
+
+                # ensure SMTP-compliant line breaks
+                s/\015?$/\015\012/s;
+                $dkim->PRINT($_);
+            }
+        }
+        $dkim->CLOSE;
+        $logger->debug("Signature  : " . $dkim->signature->as_string);
+        $logger->debug("dkim object:\n" . Dumper($dkim));
+
+        $signature = $dkim->signature->as_string;
+    } else {
+        my ($TMPFILE, $tmpfilename) = get_tempfile();
+        foreach my $fh ($QF, $DF) {
+            while (<$fh>) {
+                print $TMPFILE $_;
+            }
+        }
+        seek($TMPFILE, 0, 0);
+        my $mail = load Mail::DomainKeys::Message( File => $TMPFILE );
+        my $priv = load Mail::DomainKeys::Key::Private( File => $conf{"key-file"} );
+        $mail->sign( Method => "simple", Selector => $conf{"selector"}, Private => $priv );
+        $signature = $mail->signature->as_string;
+        $logger->debug("Signature: $signature");
+    }
+
+    return $signature;
+}
+
+#-----------------
+sub prepend_header
+#-----------------
+{
+    my ($FH, $filename, $header) = @_;
+    my ($TMPFILE, $tmpfilename) = get_tempfile();
+
+    #--------------------------------
+    # comment out to clean up headers
+    #--------------------------------
+    # $header =~ s/\015\012\s*//g;
+    # $header =~ s/\n\s*//g;
+    # $header =~ s/h=;//;
+    # $header =~ s/\s{2,}/ /;
+    #--------------------------------
+
+    # reset pointer on filehandle
+    seek($FH, 0, 0);
+
+    print $TMPFILE "H$header;\n";
+    while (<$FH>) {
+        next if /^\w\d+$/;
+        print $TMPFILE $_;
+    }
+
+    close $TMPFILE or $logger->error("Couldn't close filehandle on $tmpfilename: $!");
+    close $FH      or $logger->error("Couldn't close filehandle on $filename   : $!");
+    copy($tmpfilename, $filename) or $logger->error("Couldn't move $tmpfilename to $filename: $!");
+}
+
+#----------------
+sub signer_policy
+#----------------
+{
+    my $dkim = shift;
+
+    my $class = $conf{'type'} eq "domainkeys" ? "Mail::DKIM::DkSignature" :
+                $conf{'type'} eq "dkim"       ? "Mail::DKIM::Signature"   :
+                die "unknown signature type: $conf{type}";
+
+    my $debugfh;
+    open $debugfh, ">", $Debug_canonicalization_filename or $logger->error("Couldn't open $Debug_canonicalization_filename: $!");
+
+    my $sig;
+    if ($conf{'type'} eq "dkim") {
+        $sig = $class->new(
+                    Algorithm   => "rsa-sha1",
+                    Method      => "relaxed/relaxed",
+                    Domain      => $conf{'domain'},
+                    Selector    => $conf{'selector'},
+                    Debug_canonicalization => $debugfh
+               );
+        $sig->headerlist("Received:Message-ID:Date:From:To:Subject:X-Mailer:MIME-Version:Content-Type");
+    } else {
+        $sig = $class->new(
+                    Algorithm   => "rsa-sha1",
+                    Method      => "nofws",
+                    Domain      => $conf{'domain'},
+                    Selector    => $conf{'selector'},
+                    Debug_canonicalization => $debugfh
+               );
+        $sig->headerlist("Received:Message-ID:Date:From:To:Subject:X-Mailer:MIME-Version:Content-Type");
+    }
+    $dkim->add_signature($sig);
+
+    close $debugfh;
+
+    $signer_logger->debug($sig->canonicalization);
+    $logger->debug("In signer_policy(): \$dkim->headers: " . $dkim->headers);
+
+    return 1;
+}
+
+#-------------
+sub parse_mail
+#-------------
+{
+    # we expect an open filehandle
+    my $FH = shift;
+    seek $FH, 0, 0;
+
+    my $message;
+    $message .= $_ while <$FH>;
+    seek $FH, 0, 0;
+
+    # docs say passing a string reference is more performant
+    my $email = Email::Simple->new(\$message);
+
+    my @headers;            # entire header lines
+    my %headers;            # header name => field pairs
+
+    %headers = $email->header_pairs;
+    %headers = clean_headers(%headers);
+    # $logger->debug(Dumper(%headers));
+
+    # TODO
+    #   This should be done in send_mail(). Fix this later.
+    push @headers, "$_: " . $headers{$_} foreach keys %headers;
+    return if @headers == 0;
+
+    my $body    = MIME::QuotedPrint::decode($email->body);
+
+    return \%headers, \@headers, $body;
+}
+
+#---------------------------------------------------------------------------
+# Does exactly what it says on the tin. (TM)
+#
+# Expects an open filehandle
+#
+# TODO
+#   Make this more flexible by parsing out not only To but also From address
+#---------------------------------------------------------------------------
+sub send_mail
+#---------------------------------------------------------------------------
+{
+    my $FH = shift;
+    my ($headers, $headers_array, $body) = parse_mail($FH);
+
+    my ($to, $subject);
+    if (${$headers}{To}) {
+        $to = get_email_address_from_header(${$headers}{To}) || return;
+        delete ${$headers}{To};
+    } else {
+        $logger->error("Could not determine recpient address. Skipping message.");
+        return;
+    }
+    if (${$headers}{Subject}) {
+        $subject = ${$headers}{Subject};
+        delete ${$headers}{Subject};
+    } else {
+        $logger->error("Could not determine subject of message. Skipping.");
+        return;
+    }
+
+    # prepare sender
+    my $sender = new Mail::Sender {
+        smtp        => $conf{'external-server'},
+        from        => $conf{'external-address'},
+        on_errors   => 'code',
+        %$headers
+    };
+
+    my $boundary;
+    if (${$headers}{'Content-Type'} =~ /multipart/) {
+        if (${$headers}{'Content-Type'} =~ /boundary="(.+)"/) {
+            $boundary = $1;
+        } else {
+            return;
+        }
+
+        my @parts = parse_body_parts($body, $boundary);
+
+        #------------------------------
+        # $logger->debug(Dumper(@parts));
+        #------------------------------
+
+        $sender->OpenMultipart(
+                {
+                    to          => $to,
+                    subject     => $subject,
+                    auth        => 'PLAIN',
+                    authid      => $conf{'external-username'},
+                    authpwd     => $conf{'external-password'},
+                    multipart   => 'mixed',
+                    debug       => '/tmp/perlsenderdebug.log',
+                    debug_level => 4
+                }
+            );
+
+        $sender->Part(
+                {
+                    ctype       => 'multipart/alternative',
+                    disposition => 'NONE'
+                }
+            );
+
+        foreach my $part (@parts) {
+            if (${$part}{filename}) {
+                $sender->Attach( {
+                        ctype               => ${$part}{'Content-Type'},
+                        encoding            => ( ${$part}{'Content-Transfer-Encoding'}  ? ${$part}{'Content-Transfer-Encoding'} : 'NONE' ),
+                        disposition         => ( ${$part}{'Content-Disposition'}        ? ${$part}{'Content-Disposition'}       : 'NONE' ),
+                        content_location    => ( ${$part}{'Content-Location'}           ? ${$part}{'Content-Location'}          : undef ),
+                        file                => ${$part}{filename}
+                    } );
+
+                $logger->debug("Added attachment (${$part}{filename})");
+            } else {
+                $sender->Part( {
+                        ctype            => ${$part}{'Content-Type'},
+                        disposition      => ( ${$part}{'Content-Disposition'}        ? ${$part}{'Content-Disposition'}       : 'NONE' ),
+                        content_location => ( ${$part}{'Content-Location'}           ? ${$part}{'Content-Location'}          : undef ),
+                        charset          => ( ${$part}{'charset'}                    ? ${$part}{'charset'}                   : undef ),
+                        encoding         => ( ${$part}{'Content-Transfer-Encoding'}  ? ${$part}{'Content-Transfer-Encoding'} : 'NONE' ),
+                        msg              => ${$part}{'body'}
+                        } );
+                $sender->EndPart(${$part}{'Content-Type'}) if ${$part}{'close-part'};
+            }
+        }
+        $sender->EndPart( { "multipart/alternative" => 1 } );
+        $sender->Close;
+    } else {
+        if ($sender->MailMsg( {
+                    to      => $to,
+                    subject => $subject,
+                    msg     => $body,
+                    auth    => 'PLAIN',
+                    authid  => $conf{'external-username'},
+                    authpwd => $conf{'external-password'},
+                    debug       => '/tmp/perlsenderdebug.log',
+                    debug_level => 4
+                } ) < 0) {
+            $logger->error("Mail sending failure: $Mail::Sender::Error\n");
+            return;
+        } else {
+            $logger->info("Mail sent okay");
+        }
+    }
+}
+
+#------------------------------------------------------------------
+# Parses the body of a multipart message and returns the results as
+# a list of hashes.
+#------------------------------------------------------------------
+sub parse_body_parts
+#------------------------------------------------------------------
+{
+    my ($body, $boundary) = @_;
+
+    my $boundary_re     = qr/^(--)?-==[\w\d]+==$/;
+    my $boundary_end_re = qr/^(--)?-==[\w\d]+==--$/;
+
+    # If we don't get a filename from the Content-Location header, we make our own and keep track
+    # with this counter.
+    my $atch_count = 0;
+
+    # work around a bug caused by MIME::QuotedPrint:
+    #   boundary lines run together with the following line like this:
+    #       -==IAMABOUNDARY==
+    #       Content-Type: text/html; charset="UTF-8"
+    #       Content-Transfer-Encoding: quoted-printable
+    #
+    #   becomes:
+    #       -==IAMABOUNDARY=Content-Type: text/html; charset="UTF-8"
+    #       Content-Transfer-Encoding: quoted-printable
+    $body =~ s/^(-+==\S+?=)([\w-]+:\s*.+)$/$1=\n$2/mg;
+
+    my @parts;
+    my %cur_part;
+    my $reached_first_boundary = 0;
+    my $inside_header          = 1;
+    my $between_headers        = 0;
+
+    # use this to query if we've encountered one of the two possible types of boundary
+    my %reached                = ( "opening-boundary"   => 0,
+                                   "closing-boundary"   => 0 );
+
+    my $line_watch;
+    foreach my $line (split /\n/, $body) {
+        $line_watch = $line;
+
+#       Our df file looks something like the following:
+#
+#       This is a multi-part message in MIME format.                        skip everything up to first boundary  __
+#                                                                                                                   |
+#       ---==FIRSTBOUNDARY1234567890==                                                                            <-'                               __
+#       Content-Type: multipart/alternative:                                                                                                          |
+#           boundary="-==SECONDBOUNDARY1234567890==                         <-- definition of second (inner) boundary is in the first part-header     | outer
+#                                                                                                                                                     | boundary
+#       ---==SECONDBOUNDARY1234567890==                                                                                                               | encloses
+#       Content-Type: text/plain; charset="UTF-8"                           <-- actual text message goes into an inner boundary                       | entire
+#       Content-Transfer-Encoding: quoted-printable                                                                                                   | message
+#                                                                                                                                                     |
+#       test message                                                                                                                                  |
+#       ---==SECONDBOUNDARY1234567890==                                                                                                               |
+#       Content-Type: text/html; charset="UTF-8"                            <-- so does HTML                                                          |
+#       Content-Transfer-Encoding: quoted-printable                                                                                                   |
+#                                                                                                                                                     |
+#       <h1>Some HTML-formatted text</h1>                                                                                                             |
+#       <p>A paragraph</p>                                                                                                                            |
+#       ---==SECONDBOUNDARY1234567890==--                                   <-- closing inner boundary after last plain text/HTML part                |
+#                                                                                                                                                     |
+#       ---==FIRSTBOUNDARY1234567890==                                      <-- new outer boundary before attachments                                 |
+#       Content-Type: image/png                                                                                                                       |
+#       Content-Transfer-Encoding: base64                                                                                                             |
+#       Content-Location: http://foo.com/bar/image.png                                                                                                |
+#                                                                                                                                                     |
+#       <BASE64-ENCODED IMAGE>                                                                                                                        |
+#                                                                                                                                                     |
+#       ---==SECONDBOUNDARY1234567890==--                                   <-- last outer boundary closes message                                 <--'
+
+        # skip lines before we encounter the first boundary
+        if ((! $reached_first_boundary) && (! $line =~ /$boundary_re/)) {
+            $logger->debug("not reached first boundary and not boundary_re");
+            next;
+        }
+
+        # here we encounter our first boundary
+        if ((! $reached_first_boundary) && ($line =~ /$boundary_re/)) {
+            $logger->debug("not reached first boundary and boundary_re");
+            $reached_first_boundary = 1;
+            $inside_header = 1;
+            $between_headers = 0;
+            next;
+        }
+
+        if ($line =~ /$boundary_re/) {
+            $logger->debug("boundary_re");
+            $reached{'opening-boundary'} = 1;
+            $inside_header = 1;
+            $between_headers = 0;
+        } elsif ($line =~ /$boundary_end_re/) {
+            $logger->debug("boundary_end_re");
+            $reached{'closing-boundary'} = 1;
+            $between_headers = 1;
+        }
+
+        # A boundary that marks the end of a part. Push %cur_part on @parts
+        if ($reached{'opening-boundary'} || $reached{'closing-boundary'}) {
+            $logger->debug("reached opening or closing boundary");
+            if ($reached{'closing-boundary'}) {
+                $logger->debug("reached closing boundary");
+                $cur_part{'close-part'} = 1;            # reached an explicit end of the current part
+                                                        # this has to be reflected by a call to EndPart() in the calling scope
+                $reached{'closing-boundary'} = 0;
+            } else {
+                $reached{'opening-boundary'} = 0;
+            }
+
+            # $cur_part{attachment} has to be set if we encounter a header that indicates an attachment.
+            # That can be one of the following:
+            #
+            #   Content-Type: x/y
+            #       where x is one of
+            #           - application
+            #           - audio
+            #           - image
+            #           - video
+            #   
+            #   Content-Transfer-Encoding: base64
+            #                              ^^^^^^
+            #                              
+            #   Content-Location
+            #       (the mere presence of which)
+
+            if ($cur_part{attachment}) {
+                $logger->debug("cur_part attachment");
+                my $attachment_name;
+
+                # If Content-Location is present we have to parse it for the name of the attachment,
+                # as it should correspond to the attachment filename that the mail client shows to its user.
+                if ($cur_part{'Content-Disposition'}) {
+                    $logger->debug("Content-Disposition");
+                    if ($cur_part{'Content-Disposition'} =~ /filename="(.+)$/) {
+                        $attachment_name = $1;
+                    } else {
+                        $attachment_name = "attachment" . ++$atch_count;
+                    }
+                } elsif ($cur_part{'Content-Location'}) {
+                    $logger->debug("cur_part Content-Location");
+                    $attachment_name = $cur_part{'Content-Location'};
+                    $attachment_name =~ s{^.*/(.+)$}{$1};
+                } else {
+                    $logger->debug("no cur_part Content-Location");
+                    # Give up if we have neither a Content-Location nor a Content-Type.
+                    # That shouldn't, in fact, happen.
+                    unless ($cur_part{'Content-Type'}) {
+                        $logger->error("Content-Type missing from part header. Skipping.");
+                        next;
+                    }
+
+                    # Content-Type for a png image looks like this:
+                    #   Content-Type: image/png
+                    #   
+                    # We're only interested in the file suffix.
+                    my $extension = "";
+                    if ($cur_part{'Content-Type'} =~ m{^\s*\w+/(\w+)$}) {
+                        $logger->debug("Content-Type has a MIME type");
+                        $extension = ".$1";
+                    } else {
+                        $logger->debug("Content-Type has no MIME type");
+                        $extension = ++$atch_count;
+                    }
+                    $attachment_name = "attachment$extension";
+                }
+                $cur_part{'Content-Type'}        =~ s/^(.+)name=".+"(.*)$/$1name="$attachment_name"$2/s             if $cur_part{'Content-Type'};
+                $cur_part{'Content-Disposition'} =~ s/^(.+)filename=".+"(.*)$/$1filename="$attachment_name"$2/s     if $cur_part{'Content-Disposition'};
+
+                if (scalar(keys(%cur_part)) >= 2) {
+                    $logger->debug("scalar(keys(\%cur_part)) >= 2");
+                    if ($cur_part{body}) {
+                        $logger->debug("cur_part body");
+                        $cur_part{filename} = attachment_to_file(%cur_part, filename => $attachment_name );
+                    }
+                }
+            }
+            push @parts, { %cur_part } unless scalar(keys(%cur_part)) < 2;
+
+            %cur_part = ( );
+            next;
+        }
+
+        next if $between_headers;
+
+
+        # okay, we're now inside one of the parts
+
+        # are we inside a header?
+        if ($inside_header) {
+            # do we have a correctly formatted header?
+            if ($line =~ /^([\w-]+):\s*(.+)$/) {
+                my ($header_name, $header_value) = ($1, $2);
+
+                # if we're dealing with a Content-Type header, we have to try and parse out the charset
+                if ($header_name eq 'Content-Type') {
+                    if ($header_value =~ /application|audio|image|video/i) {
+                        $cur_part{attachment} = 1;
+                    }
+
+                    if ($header_value =~ /^(.+);\s*charset="(.+)"$/) {
+                        $cur_part{'Content-Type'} = $1;
+                        $cur_part{'charset'}      = $2;
+                    } else {                                            # got a Content-Type but no charset
+                        $cur_part{'Content-Type'} = $header_value;
+                    }                                                   # END charset
+                } elsif ($header_name eq 'Content-Transfer-Encoding') {
+                    $cur_part{$header_name} = $header_value;
+                    $cur_part{attachment} = 1 if $header_value eq 'base64';
+                } elsif ($header_name eq 'Content-Location') {
+                    $cur_part{$header_name} = $header_value;
+                    $cur_part{attachment} = 1;
+                } else {                                                # we have a regular header key => value pair
+                    $cur_part{$header_name} = $header_value;
+                }                                                       # END Content-Type
+            } elsif ($line =~ /^\s*$/) {                                # blank line marks end of header
+                $inside_header = 0;
+                $logger->debug("reset inside_header");
+            } else {                                                    # malformed header, this should not happen
+                $logger->warn("Bad header format: $line");
+            }                                                           # END parse header line
+        } else {
+            $cur_part{'body'} .= $line;
+        }                                                               # END inside header
+    }
+
+    return @parts;
+}
+
+#---------------------------------------------------------------------------------------
+# changes a specified header
+#
+# takes four or five arguments:
+#   $filename       name of the mail file
+#   $FH             the corresponding file handle
+#   $header         a reference to a list of headersthat are to be changed
+#                   and either one more argument:
+#   $pattern        a replacement string for the entire header line (including
+#                   the header name itself, i.e. something like "HSubject: ..."
+#                   or two more arguments:
+#   $pattern        a pattern for the first part of s///
+#   $substring      a replacement string for the second part of s///
+#---------------------------------------------------------------------------------------
+sub change_header
+#---------------------------------------------------------------------------------------
+{
+    my ($filename, $FH, $headers, $pattern) = @_;
+    my $substring                           = $_[4] or undef;
+    my @contents;
+
+    seek ($FH, 0, 0);
+
+    while (<$FH>) {
+        my $line = $_;
+        foreach (@$headers) {
+            if ($line =~ /^H$_:/) {
+                if ($substring) {
+                    $line =~ s/$pattern/$substring/;
+                } else {
+                    $line = $pattern;
+                }
+            }
+        }
+        push @contents, $line;
+    }
+
+    unless (open $FH, '>', $filename) {
+        $logger->error("Couldn't open file $filename for writing: $!");
+        return;
+    }
+
+    print $FH $_ foreach @contents;
+
+    # the FH is expected to be in read-mode
+    unless (open $FH, $filename) {
+        $logger->error("Couldn't open file $filename for reading: $!");
+        return;
+    }
+
+    return 1;
+}
+
+#------------------------------------------------------------------
+# Pass in an email header and get an email address from the string.
+# The header is expected to be in the form
+#   "John Doe" <john.doe@example.tld>
+#               ^^^^^^^^^^^^^^^^^^^^
+#------------------------------------------------------------------
+sub get_email_address_from_header
+#------------------------------------------------------------------
+{
+    return $_[0] =~ /<(\S+\@\S+)>/ ? $1 : undef;
+}
+
+#------------------------------------------------------------------------
+# Clean up some of the eccentricities of the headers generated by OpenEMM
+#------------------------------------------------------------------------
+sub clean_headers
+#------------------------------------------------------------------------
+{
+    # we expect a hash of header name => header value pairs
+    my %headers = @_;
+
+    my %clean_headers;
+    my ($key, $value);
+    while (($key, $value) = each %headers) {
+        $key =~ s/^([HP]\?)+(\S+)\s*/$2/;
+        $key =~ s/^H([A-Z]\S+)\s*/$1/;
+
+        # OpenEMM sumbitches broke standards compliance in 6.0.1.
+        # Names in From and Reply-To headers need to be put in quotes, 6.0.1 leaves them out.
+        # 
+        # i.e. instead of:
+        #   From: Company Inc. <webmaster@company.com>
+        #   Reply-To: Company Inc. <webmaster@company.com>
+        #   
+        # the name "Company Inc." has to be put in quotation marks in both instances:
+        #   From: "Company Inc." <webmaster@company.com>
+        #   Reply-To: "Company Inc." <webmaster@company.com>
+        #
+        if ($key =~ /^(From)|(Reply-To)/) {
+            $value =~ s/^(.+?)(\s*<\S+\@\S+>\s*)$/"$1"$2/;
+        }
+
+        # the last header might have a trailing period that needs to be removed
+        $value =~ s/\s+\.\s*$//;
+        $clean_headers{$key} = $value;
+    }
+
+    return %clean_headers;
+}
+
+#----------------- END MAIL SUBS --------------------------------------------------------
+
+
+#----------------- MISC UTIL SUBS -------------------------------------------------------
+
+#----------------------------------
+# This comes from the Perl Cookbook
+#----------------------------------
+sub read_config
+#----------------------------------
+{
+    my $filename = shift;
+    unless (open CONF, $filename) {
+        warn "Couldn't open config file $filename: $!\n";
+        return ( error => 1 );
+    }
+
+    my %conf;
+    while (<CONF>) {
+        chomp;
+        s/#.*//;
+        s/^\s+//;
+        s/\s+$//;
+        next unless length;
+        my ($key, $value) = split(/\s*=\s*/, $_, 2);
+        $conf{$key} = $value;
+    }
+
+    %conf;
+}
+
+#-------------------------------------
+# This, too, is from the Perl Cookbook
+#-------------------------------------
+sub merge_hashes
+#-------------------------------------
+{
+    my ($hash1, $hash2) = @_;
+    my %result;
+
+    my ($key, $value);
+    while (($key, $value) = each(%{ $hash1 })) {
+        $result{$key} = $value;
+    }
+    while (($key, $value) = each(%{ $hash2 })) {
+        $result{$key} = $value;
+    }
+    %result;
+}
+
+#-------------------------------------------------------
+# returns current time in format HH:MM:SS, e.g. 12:34:56
+#-------------------------------------------------------
+sub get_timestamp
+#-------------------------------------------------------
+{
+    my ($sec, $min, $hour) = (localtime)[0, 1, 2];
+    foreach ($sec, $min, $hour) {
+        $_ = "0$_" if $_ < 10;
+    }
+
+    "$hour:$min:$sec";
+}
+
+#------------------------------------------------------
+# get a tempfile in the system's default temp directory
+#------------------------------------------------------
+sub get_tempfile
+#------------------------------------------------------
+{
+    # we will not try and make this portable
+    # list of possible temp dir candidates in order of preference
+    my @possible_dirs = qw(
+            /tmp
+            /var/tmp
+        );
+    my $tmpdir;
+    foreach (@possible_dirs) {
+        if (-d $_) {
+            my $candidate = File::Spec->catdir($_, "mailmover");
+            if (-d $candidate) {
+                $tmpdir = $candidate;
+            } else {
+                if (mkdir $candidate, 0700) {
+                    $tmpdir = $candidate;
+                } else {
+                    $logger->warn("Couldn't create temp directory $candidate: $!");
+                    $tmpdir = $_;
+                } # mkdir
+            } # -d $candidate
+            last;
+        } # -d $_
+    } # foreach
+    unless ($tmpdir) {
+        $tmpdir = File::Spec->catdir(getcwd, "tmp");
+        unless (-d $tmpdir) {
+            unless (mkdir $tmpdir, 0700) {
+                # fall back to CWD
+                $tmpdir = getcwd;
+                $logger->warn("Couldn't create a temporary directory. Falling back to CWD (" . getcwd . ")");
+            }
+        }
+    }
+
+    return tempfile("mailmoverXXXXXXXX", DIR => $tmpdir);
+}
+
+#------------------------------------------------------
+# decode a base64 attachment and write it to a tempfile
+# returns the filename
+#------------------------------------------------------
+sub attachment_to_file
+#------------------------------------------------------
+{
+    #-------------------------------------------------
+    $logger->debug("I'm now in attachment_to_file()");
+    #-------------------------------------------------
+
+    my %part = @_;
+    my ($TMP, $tmp_filename) = get_tempfile();
+
+    print $TMP $part{body};
+    close $TMP or $logger->warn("Couldn't close filehandle on tempfile: $!");
+    unless (open $TMP, $tmp_filename) {
+        $logger->warn("Couldn't reopen filehandle for reading: $!");
+        return;
+    }
+
+    my $buf;
+    my $attachment_filename = "/tmp/mailmover/" . $part{filename};
+    unless (open OUT, '>', $attachment_filename) {
+        $logger->error("Couldn't open $attachment_filename: $!");
+        return;
+    }
+
+    if ($part{'Content-Transfer-Encoding'} eq 'base64') {
+        while (read($TMP, $buf, 60 * 57)) {
+            print OUT decode_base64($buf);
+        }
+    }
+
+    close $TMP or $logger->warn("Couldn't close filehandle on tempfile: $!");
+    close OUT  or $logger->warn("Couldn't close filehandle on $attachment_filename: $!");
+
+    return $attachment_filename;
+}
+
+#########################################################################################
+
+
+__END__
+
+=head1 mailmover
+
+mailmover - A tool to redirect mail files from any directory to
+            any other directory (usually the system's default mail queue).
+
+=head1 SYNOPSIS
+
+mailmover [-c] [--dest-dir] [-l] [--source-dir] [-v|-h]
+          [--domain] [--key-file] [--selector] [--type]
+          [--nosign [--move-all]] [--external-mailer]
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<    --selector>
+
+The selector used by DKIM.
+
+=item B<    --source-dir>
+
+Directory to copy mail from.
+
+=item B<    --dest-dir>
+
+Directory to copy mail to, usually the system-wide mail queue (e.g. /var/spool/mailq).
+
+=item B<    --domain>
+
+The domain name used by DKIM
+
+=item B<-e, --external-mailer>
+
+Don't sign messages. Just send them via an MTA specified in the configuration file.
+
+=item B<-h, --help>
+
+Display help screen and exit.
+
+=item B<-k, --key-file>
+
+Full path to and file name of the file containing the private key with which to
+DKIM-sign messages.
+
+=item B<-l, --log-level>
+
+The logger's threshold value. May be one of DEBUG, INFO, WARN, ERROR.
+
+=item B<-n, --nosign>
+
+Do not sign the messages, only move them
+
+=item B<-m, --move-all>
+
+Move all messages/files as soon as they come in. Works only in conjunction with
+--nosign.
+
+=item B<-v, --version>
+
+Display version screen and exit.
+
+=back
+
+=head1 DESCRIPTION
+
+MailMover was originally written to be used in conjunction with OpenEMM, an open-source
+newsletter management application. OpenEMM does not, itself provide support for
+I<DomainKeys Identified Mail> (I<DKIM>). So, the idea was born to write a tool which
+monitors OpenEMM's own mail queue directory, signs outbound mails and moves them to the system-wide
+mail queue (/var/spool/mailq on Debian based systems) as soon as they land there. From
+there on, the system-wide sendmail process takes over.
+
+=head1 CONFIGURATION
+
+MailMover reads in a configuration file that is per default located in ${HOME}/.mailmover.conf.
+The config file is made up of command line options minus the preceding dashes as keys.
+Comments on a line of their own preceded by a hash sign (#) are ignored, as are blank lines and
+trailing whitespace.
+
+Command line options take precedence over configuration file options. Configuration file options
+take precedence over default options.
+
+=head1 BUGS
+
+A few. Probably. Let me know if you find any. :-)
+
+=head1 LICENSE
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=head1 AUTHOR
+
+Sven-Thorsten Fahrbach
+You can reach me at <joran@alice-dsl.de>
