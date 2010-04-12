@@ -1,0 +1,14 @@
+default {
+    at-once:        1000
+    wait-for-sec:   180
+}
+
+yahoo.com {
+    at-once:        100
+    wait-for-sec:   3600
+}
+
+web.de {
+    at-once:        10
+    wait-for-sec:   1800
+}

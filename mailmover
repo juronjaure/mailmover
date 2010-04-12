@@ -1166,6 +1166,8 @@ sub read_domain_config
             next;
         }
     }
+
+    return %domains;
 }
 
 #-------------------------------------
