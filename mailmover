@@ -1134,6 +1134,38 @@ sub read_config
 sub read_domain_config
 #------------------------------------------------------------
 {
+    my $filename = shift;
+    my %domains = ( default => { "at-once"      => 1000,
+                                 "wait-for-sec" => 180 } );
+
+    unless (open CONF, $filename) {
+        $logger->warn("Couldn't open config file $filename: $!\n");
+        return %domains;
+    }
+
+    my $cur_domain;
+    my $inside_block = 0;
+    while (<CONF>) {
+        chomp;
+        next if /^#/;
+        s/^\s+//;
+        s/\s+$//;
+        next unless length;
+
+        if ((! $inside_block) && (/^(\S+)\s*\{$/)) {            # opening block
+            $inside_block = 1;
+            $cur_domain   = $1;
+            next;
+        }
+        if ($inside_block && (/^(\S+)\s*:\s*(\S+)$/)) {         # regular line inside blcok
+            $domains{$cur_domain} = { $1 => $2 };
+            next;
+        }
+        if ($_ eq '}') {                                        # closing block
+            $inside_block = 0;
+            next;
+        }
+    }
 }
 
 #-------------------------------------
