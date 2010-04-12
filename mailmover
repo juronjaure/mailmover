@@ -1112,6 +1112,30 @@ sub read_config
     %conf;
 }
 
+#------------------------------------------------------------
+# Read in domain-specific information from separate log file.
+#
+# The file looks something like this:
+#   default {
+#       at-once:        1000
+#       wait-for-sec:   180
+#   }
+#
+#   yahoo.com {
+#       at-once:        100
+#       wait-for-sec:   3600
+#   }
+#
+#   web.de {
+#       at-once:        10
+#       wait-for-sec:   1800
+#   }
+#------------------------------------------------------------
+sub read_domain_config
+#------------------------------------------------------------
+{
+}
+
 #-------------------------------------
 # This, too, is from the Perl Cookbook
 #-------------------------------------
