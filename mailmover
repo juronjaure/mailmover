@@ -80,13 +80,14 @@ $Data::Dumper::Purity = 1;
 #----------------- SET CONFIG DEFAULTS --------------------------------------------------
 #
 #   we need the following config values:
-#       source-dir - where we copy our mails from
-#       dest-dir   - where we copy our mails to
-#       log-level  - guess
-#       conf-file  - :-)
-#       key-file   - the private key used to sign the message
-#       selector   - DKIM selector
-#       domain     - DKIM domain
+#       source-dir      - where we copy our mails from
+#       dest-dir        - where we copy our mails to
+#       log-level       - guess
+#       conf-file       - :-)
+#       key-file        - the private key used to sign the message
+#       selector        - DKIM selector
+#       domain          - DKIM domain
+#       domains-config  - config file with mail sending limits for different domains
 #
 #----------------------------------------------------------------------------------------
 
@@ -96,6 +97,7 @@ my %defaults = ('source-dir'     => getcwd,
                 'dest-dir'       => "/var/spool/mqueue",
                 'log-level'      => undef,
                 'conf-file'      => $MAILMOVER_CONF,
+                'domains-config' => '/etc/mailmover/mailmover.domains',
                 'key-file'       => "/etc/mailmover/private.key",
                 'type'           => "domainkeys");
 
@@ -110,6 +112,7 @@ my %options;
 GetOptions(\%options, "source-dir=s",
                       "dest-dir=s",
                       "domain=s",
+                      "domains-config=s",
                       "key-file=s",
                       "selector=s",
                       "log-level=s",
@@ -272,6 +275,15 @@ if (! $conf{'external-mailer'}) {
 }
 
 #----------------- END INCONSISTENCY CHECK ----------------------------------------------
+
+
+
+#----------------- GET DOMAIN LIMITS ----------------------------------------------------
+
+my %domain_limits = read_domain_config($conf{'domains-config'});
+
+#----------------- END DOMAIN LIMITS ----------------------------------------------------
+
 
 ###############    END BASIC CONFIGURATION    ###########################################
 
@@ -1158,7 +1170,7 @@ sub read_domain_config
             next;
         }
         if ($inside_block && (/^(\S+)\s*:\s*(\S+)$/)) {         # regular line inside blcok
-            $domains{$cur_domain} = { $1 => $2 };
+            ${ $domains{$cur_domain} }{$1} = $2;
             next;
         }
         if ($_ eq '}') {                                        # closing block
@@ -1166,6 +1178,13 @@ sub read_domain_config
             next;
         }
     }
+
+    #-------------------------------
+    # DEBUG
+    #-------------------------------
+    # print Dumper %domains;
+    # exit 0;
+    #-------------------------------
 
     return %domains;
 }
@@ -1301,6 +1320,7 @@ mailmover - A tool to redirect mail files from any directory to
 mailmover [-c] [--dest-dir] [-l] [--source-dir] [-v|-h]
           [--domain] [--key-file] [--selector] [--type]
           [--nosign [--move-all]] [--external-mailer]
+          [--domains-config]
 
 =head1 OPTIONS
 
@@ -1321,6 +1341,10 @@ Directory to copy mail to, usually the system-wide mail queue (e.g. /var/spool/m
 =item B<    --domain>
 
 The domain name used by DKIM
+
+=item B<    --domains-config>
+
+Path to the file in which limits for individual domains are stored.
 
 =item B<-e, --external-mailer>
 

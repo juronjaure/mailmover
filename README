@@ -5,7 +5,7 @@ mailmover
 SYNOPSIS
     mailmover [-c] [--dest-dir] [-l] [--source-dir] [-v|-h] [--domain]
     [--key-file] [--selector] [--type] [--nosign [--move-all]]
-    [--external-mailer]
+    [--external-mailer] [--domains-config]
 
 OPTIONS
      --selector
@@ -20,6 +20,10 @@ OPTIONS
 
      --domain
             The domain name used by DKIM
+
+     --domains-config
+            Path to the file in which limits for individual domains are
+            stored.
 
     -e, --external-mailer
             Don't sign messages. Just send them via an MTA specified in the
